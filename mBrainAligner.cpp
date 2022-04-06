@@ -1,4 +1,5 @@
 
+
 #include "mBrainAligner.h"
 #include "calHogFeature.h"
 #include "preprocessing.h"
@@ -7,6 +8,13 @@
 
 //linear interpolate the SubDFBlock to DFBlock
 //use 3d or 4d pointer instead of 1d, since generating 3d or 4d pointer from 1d is time consuming
+
+extern "C" int gpu_QR(int ncpt, const Matrix &A, Matrix &Q, Matrix &R);
+extern "C" int gpu_extendornormal(int ncpt, int n, Matrix &Q);
+extern "C" bool gpu_A(int ncpt, const Matrix &q2_t, const Matrix &xnxn_K, Matrix &A);
+extern "C" int gpu_A_i(int ncpt, const Matrix &A, Matrix &A_i);
+extern "C" bool gpu_xnxn(int ncpt, const Matrix &q2, const Matrix &A_t, Matrix &C);
+extern "C" int gpu_computedistance(int nCpt, V3DLONG gsz2, V3DLONG gsz1, V3DLONG gsz0, V3DLONG gfactor_x, V3DLONG gfactor_y, V3DLONG gfactor_z, Matrix &x4x4_d, Matrix &xnx4_c, float * H_X, float * H_Y, float * H_Z, DisplaceFieldF3D *** df_local_3d);
 
 //same as hanchuan's jab method (assume invalid pixel intensity<0)
 
@@ -213,6 +221,99 @@ bool q_mse(float *&I1, float *&I2, long long npixels, float &mse)
 	return true;
 }
 
+
+
+
+bool q_TPS_cd_gpu(const vector<point3D64F> &vec_sub, const vector<point3D64F> &vec_tar, const double d_lamda,
+	Matrix &x4x4_d, Matrix &xnx4_c, Matrix &xnxn_K)
+{
+	//check parameters
+	if (vec_sub.size()<4 || vec_sub.size() != vec_tar.size())
+	{
+		printf("ERROR: Invalid input parameters! \n");
+		return false;
+	}
+	V3DLONG n_pts = vec_sub.size();
+	if (xnx4_c.nrows() != n_pts || xnx4_c.ncols() != 4)
+		xnx4_c.ReSize(n_pts, 4);
+	if (x4x4_d.nrows() != 4 || xnx4_c.ncols() != 4)
+		x4x4_d.ReSize(4, 4);
+	if (xnxn_K.nrows() != n_pts || xnxn_K.ncols() != n_pts)
+		xnxn_K.ReSize(n_pts, n_pts);
+
+	//generate TPS kernel matrix K=-r=-|xi-xj|
+	if (!q_TPS_k(vec_sub, vec_sub, xnxn_K))
+	{
+		printf("ERROR: q_TPS_k() return false! \n");
+		return false;
+	}
+	//printf("ncpt:%d\n", n_pts);
+	//
+	Matrix X(n_pts, 4), Y(n_pts, 4);
+	Matrix Q_ori(n_pts, n_pts); Q_ori = 0.0;
+	Matrix Q_ori1(n_pts, n_pts); Q_ori1 = 0.0;
+	for (V3DLONG i = 0; i<n_pts; i++)
+	{
+		Q_ori1(i + 1, 1) = Q_ori(i + 1, 1) = X(i + 1, 1) = 1;
+		Q_ori1(i + 1, 2) = Q_ori(i + 1, 2) = X(i + 1, 2) = vec_sub[i].x;
+		Q_ori1(i + 1, 3) = Q_ori(i + 1, 3) = X(i + 1, 3) = vec_sub[i].y;
+		Q_ori1(i + 1, 4) = Q_ori(i + 1, 4) = X(i + 1, 4) = vec_sub[i].z;
+
+		Y(i + 1, 1) = 1;
+		Y(i + 1, 2) = vec_tar[i].x;
+		Y(i + 1, 3) = vec_tar[i].y;
+		Y(i + 1, 4) = vec_tar[i].z;
+	}
+	Matrix Q(n_pts, n_pts);
+	clock_t stps_start1;
+	stps_start1 = clock();
+	Matrix R(4, 4);
+	UpperTriangularMatrix R1;
+	
+	clock_t stps_startqr;
+	stps_startqr = clock();
+	//gpu_QR(n_pts, Q_ori, Q, R);
+	QRZ(Q_ori1, R1);
+	Q = Q_ori1;
+
+	
+	clock_t stps_start2;
+	stps_start2 = clock();
+	gpu_extendornormal(n_pts, 4, Q);
+	
+	Matrix q1 = Q.columns(1, 4);
+	
+	Matrix q2 = Q.columns(5, n_pts);
+
+	Matrix r = R1.submatrix(1, 4, 1, 4);
+
+	Matrix A(n_pts - 4, n_pts - 4); A = 0.0;
+	clock_t stps_start3;
+	stps_start3 = clock();
+	gpu_A(n_pts, q2, xnxn_K, A);
+
+	
+	A = A + IdentityMatrix(n_pts - 4)*d_lamda;
+
+	Matrix A_i(n_pts - 4, n_pts - 4); A_i = 0.0;
+	clock_t stps_startni;
+	stps_startni = clock();
+	gpu_A_i(n_pts, A, A_i);
+	
+	Matrix xnx4_c1(n_pts, n_pts);
+	clock_t stps_start6;
+	stps_start6 = clock();
+	gpu_xnxn(n_pts, q2, A_i, xnx4_c1);
+	
+	xnx4_c = xnx4_c1*Y;
+	
+	clock_t stps_start4;
+	stps_start4 = clock();
+	x4x4_d = r.i()*q1.t()*(Y - xnxn_K*xnx4_c);
+
+	return true;
+}
+
 bool q_TPS_cd(const vector<point3D64F> &vec_sub, const vector<point3D64F> &vec_tar, const double d_lamda,
 	Matrix &x4x4_d, Matrix &xnx4_c, Matrix &xnxn_K)
 {
@@ -236,6 +337,8 @@ bool q_TPS_cd(const vector<point3D64F> &vec_sub, const vector<point3D64F> &vec_t
 		printf("ERROR: q_TPS_k() return false! \n");
 		return false;
 	}
+	
+
 	//------------------------------------------------------------------
 	//compute the QR decomposition of x
 	Matrix X(n_pts, 4), Y(n_pts, 4);
@@ -320,6 +423,7 @@ bool q_imagewarp_stps(const vector<point3D64F> &vec_ctlpt_tar, const vector<poin
 		printf("WARNNING: output image pointer is not null, original memeroy it point to will lost!\n");
 		p_img_stps = 0;
 	}
+
 	//------------------------------------------------------------------------------------------------------------------------------------
 	//assign output/warp image size
 	long long sz_img_output[4] = { 0 };
@@ -345,6 +449,7 @@ bool q_imagewarp_stps(const vector<point3D64F> &vec_ctlpt_tar, const vector<poin
 		if (p_img_sub2tar_4d) 	{ delete4dpointer(p_img_sub2tar_4d, sz_img_output[0], sz_img_output[1], sz_img_output[2], sz_img_output[3]); }
 		return false;
 	}
+
 	//------------------------------------------------------------------------------------------------------------------------------------
 	//compute sub2tar tps warp parameters
 	Matrix x4x4_affine, xnx4_c, xnxn_K;
@@ -356,6 +461,7 @@ bool q_imagewarp_stps(const vector<point3D64F> &vec_ctlpt_tar, const vector<poin
 		if (p_img_stps) 			{ delete[]p_img_stps;		p_img_stps = 0; }
 		return false;
 	}
+
 #pragma omp parallel for
 	for (long long x = 0; x < sz_img_output[0]; x++)
 	{
@@ -874,6 +980,8 @@ bool downsapmle_3Dmarker(vector<point3D64F> & out_marker, vector<point3D64F> inp
 	}
 	return true;
 }
+
+
 bool mul_scale_mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vector<point3D64F> fine_sub_corner, 
 	vector<point3D64F> aver_corner, vector<int> label, long long * sz_img , float * p_img32f_tar, 
 	float * p_img32f_sub_bk, float * p_img32_sub_label, unsigned char * p_img_sub, map <int, float *> & density_map_sub)
@@ -1004,6 +1112,7 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 	}
 	
 	//paras
+	int GPU_acceleration = input_Parameter.GPU_acceleration;
 	int nfeature = 3;
 	int search_radius = input_Parameter.search_radius;
 	int nneighbors = 1;//+1 for include itself
@@ -1346,7 +1455,8 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 
 						float lam1 = lam;
 						stps_vec_sub_warp = stps_vec_tar;
-					    auto_warp_marker(lam1, stps_vec_tar, stps_vec_sub, stps_vec_sub_warp);
+						if (input_Parameter.GPU_acceleration == 0)auto_warp_marker(lam1, stps_vec_tar, stps_vec_sub, stps_vec_sub_warp);
+						if (input_Parameter.GPU_acceleration == 1)auto_warp_marker(lam1, stps_vec_tar, stps_vec_sub, stps_vec_sub_warp);//The GPU will miscalculate if the number of points is too low
 						//auto_warp_marker(lam1, stps_vec_tar, stps_vec_sub, stps_vec_sub_warp);
 					
 						for (unsigned V3DLONG i = 0; i < stps_vec_tar.size(); i++)
@@ -1480,6 +1590,8 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 					vec_corner_new[i].z = x_tps(i + 1, 4);
 			}
 		}
+
+
 		//warp subject image based on updated landmark positionº∆À„Àƒ¥Œ
 
 		/*if (iter == max_iteration)*/
@@ -1492,6 +1604,7 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 				tmp.x = vec_corners[i].x; tmp.y = vec_corners[i].y; tmp.z = vec_corners[i].z; tmp.radius = 5, tmp.shape = 1; ql_marker_tar.push_back(tmp);
 				tmp.x = vec_corner_new[i].x; tmp.y = vec_corner_new[i].y; tmp.z = vec_corner_new[i].z; tmp.radius = 5, tmp.shape = 1;	ql_marker_sub.push_back(tmp);
 			}
+
 			//warp float type image for next iteration
 			V3DLONG szBlock_x, szBlock_y, szBlock_z;
 			szBlock_x = szBlock_y = szBlock_z = 4;
@@ -1502,38 +1615,35 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 			//warp uint8 type image for save
 			{
 				unsigned char *p_img_warp = 0;
-				imgwarp_smallmemory(p_img_sub, sz_img_tar,ql_marker_tar, ql_marker_sub,
+				imgwarp_smallmemory(p_img_sub, sz_img_tar, GPU_acceleration, ql_marker_tar, ql_marker_sub,
 					szBlock_x, szBlock_y, szBlock_z, i_interpmethod_df, i_interpmethod_img,
 					p_img_warp);
 				char filename[2000];
 				QString save_file = input_Parameter.save_path + "local_registered_image";
 				sprintf(filename, "%s", qPrintable(save_file));
 
-				long long sz_img_tar_tmp[4];
-				for (int i = 0; i < 4; i++)
+
+				l_saveImage(filename, (unsigned char *)p_img_warp, sz_img_tar, pad_x / input_Parameter.resample, pad_y / input_Parameter.resample, pad_z / input_Parameter.resample);
+
+				for (long long i = 0; i < vec_corners.size(); i++)
 				{
-					sz_img_tar_tmp[i] = sz_img_tar[i];
+					ql_marker_tar[i].x = ql_marker_tar[i].x - pad_x / input_Parameter.resample; ql_marker_tar[i].y = ql_marker_tar[i].y - pad_y / input_Parameter.resample; ql_marker_tar[i].z = ql_marker_tar[i].z - pad_z / input_Parameter.resample;
+					ql_marker_sub[i].x = ql_marker_sub[i].x - pad_x / input_Parameter.resample; ql_marker_sub[i].y = ql_marker_sub[i].y - pad_y / input_Parameter.resample; ql_marker_sub[i].z = ql_marker_sub[i].z - pad_z / input_Parameter.resample;
 				}
 
-				if (sz_img_tar[0] == (528 + (2 * padsz)))
-				{
-					p_img_warp = del_pad(p_img_warp, padsz); sz_img_tar_tmp[0] = sz_img_tar_tmp[0] - (2 * padsz);
-					for (long long i = 0; i < vec_corners.size(); i++)
-					{
-						ql_marker_tar[i].x = ql_marker_tar[i].x - padsz;
-						ql_marker_sub[i].x = ql_marker_sub[i].x - padsz;
-					}
-				}
 
-				l_saveImage(filename, (unsigned char *)p_img_warp, sz_img_tar_tmp);
 				if (p_img_warp) 		{ delete[]p_img_warp;			p_img_warp = 0; }
 
+		
 				//save as marker files
 				sprintf(filename, "%slocal_registered_tar.marker", qPrintable(input_Parameter.save_path));	writeMarker_file(filename, ql_marker_tar);
-				sprintf(filename, "%slocal_registered_sub.marker", qPrintable(input_Parameter.save_path));	writeMarker_file(filename, ql_marker_sub);			
+				sprintf(filename, "%slocal_registered_sub.marker", qPrintable(input_Parameter.save_path));	writeMarker_file(filename, ql_marker_sub);
+				
+				
 			}
 			//printf("\t>>stps_imgwarp_smallmemory time consume %.2f s\n", (float)(clock() - stps_imgwarp_smallmemory) / CLOCKS_PER_SEC);
 		}
+
 		for (int i = 0; i < vec_corners.size(); i++)
 		{
 			for (int j = 0; j < npixels_featmap; j++)
@@ -1543,6 +1653,7 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 		}
 
 	}
+
 	fine_sub_corner = vec_corner_new;
 	for (int i = 0; i < fine_sub_corner.size(); i++)
 	{
@@ -1550,6 +1661,7 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 		fine_sub_corner[i].y = fine_sub_corner[i].y*input_Parameter.resample;
 		fine_sub_corner[i].z = fine_sub_corner[i].z*input_Parameter.resample;
 	}
+
 	//release memory
 	{
 		for (int i = 0; i < vec_corners.size(); i++)
@@ -1576,5 +1688,6 @@ bool mBrainAligner(Parameter input_Parameter, vector<point3D64F>vec_corners, vec
 			if (density_map_sub_4d[label[i]]) 		{ delete4dpointer(density_map_sub_4d[label[i]], sz_img_tar[0], sz_img_tar[1], sz_img_tar[2], sz_img_tar[3]); }
 		}
 	}
+	
 	return true;
 }
